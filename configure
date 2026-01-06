@@ -362,6 +362,7 @@ External library support:
   --enable-rkmpp           enable Rockchip Media Process Platform code [no]
   --disable-v4l2-m2m       disable V4L2 mem2mem code [autodetect]
   --disable-vaapi          disable Video Acceleration API (mainly Unix/Intel) code [autodetect]
+  --enable-vaapi-dlopen    use dlopen for libva instead of linking [no]
   --disable-vdpau          disable Nvidia Video Decode and Presentation API for Unix code [autodetect]
   --disable-videotoolbox   disable VideoToolbox code [autodetect]
   --disable-vulkan         disable Vulkan code [autodetect]
@@ -2130,6 +2131,7 @@ CONFIG_LIST="
     ptx_compression
     resource_compression
     thumb
+    vaapi_dlopen
     valgrind_backtrace
     xmm_clobber_test
     $COMPONENT_LIST
@@ -7447,21 +7449,70 @@ fi
 enabled libdrm &&
     check_pkg_config libdrm_getfb2 libdrm "xf86drmMode.h" drmModeGetFB2
 
-enabled vaapi &&
-    check_pkg_config vaapi "libva >= 0.35.0" "va/va.h" vaInitialize
+if enabled vaapi_dlopen; then
+    # When using dlopen, we only need headers for type definitions
+    # Get include path from pkg-config but don't link against libva
+    vaapi_cflags=$(${pkg_config} --cflags "libva >= 0.35.0" 2>/dev/null)
+    if test -n "$vaapi_cflags"; then
+        add_cflags $vaapi_cflags
+        enable vaapi
+    elif check_headers va/va.h; then
+        enable vaapi
+    else
+        disable vaapi vaapi_dlopen
+    fi
+else
+    enabled vaapi &&
+        check_pkg_config vaapi "libva >= 0.35.0" "va/va.h" vaInitialize
+fi
 
 if enabled vaapi; then
-    case $target_os in
-        mingw32*|mingw64*|win32|win64)
-            check_pkg_config vaapi_win32 "libva-win32" "va/va_win32.h" vaGetDisplayWin32
-            ;;
-        *)
-            check_pkg_config vaapi_drm "libva-drm" "va/va_drm.h" vaGetDisplayDRM
-            ;;
-    esac
+    if enabled vaapi_dlopen; then
+        # For dlopen mode, just check headers exist (get cflags from pkg-config)
+        case $target_os in
+            mingw32*|mingw64*|win32|win64)
+                vaapi_win32_cflags=$(${pkg_config} --cflags "libva-win32" 2>/dev/null)
+                if test -n "$vaapi_win32_cflags"; then
+                    add_cflags $vaapi_win32_cflags
+                    enable vaapi_win32
+                elif check_headers va/va_win32.h; then
+                    enable vaapi_win32
+                fi
+                ;;
+            *)
+                vaapi_drm_cflags=$(${pkg_config} --cflags "libva-drm" 2>/dev/null)
+                if test -n "$vaapi_drm_cflags"; then
+                    add_cflags $vaapi_drm_cflags
+                    enable vaapi_drm
+                elif check_headers va/va_drm.h; then
+                    enable vaapi_drm
+                fi
+                ;;
+        esac
+    else
+        # Traditional compile-time linking
+        case $target_os in
+            mingw32*|mingw64*|win32|win64)
+                check_pkg_config vaapi_win32 "libva-win32" "va/va_win32.h" vaGetDisplayWin32
+                ;;
+            *)
+                check_pkg_config vaapi_drm "libva-drm" "va/va_drm.h" vaGetDisplayDRM
+                ;;
+        esac
+    fi
 
     if enabled xlib_x11; then
-        check_pkg_config vaapi_x11 "libva-x11" "va/va_x11.h" vaGetDisplay
+        if enabled vaapi_dlopen; then
+            vaapi_x11_cflags=$(${pkg_config} --cflags "libva-x11" 2>/dev/null)
+            if test -n "$vaapi_x11_cflags"; then
+                add_cflags $vaapi_x11_cflags
+                enable vaapi_x11
+            elif check_headers va/va_x11.h; then
+                enable vaapi_x11
+            fi
+        else
+            check_pkg_config vaapi_x11 "libva-x11" "va/va_x11.h" vaGetDisplay
+        fi
     fi
 
     check_cpp_condition vaapi_1 "va/va.h" "VA_CHECK_VERSION(1, 0, 0)"

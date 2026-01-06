@@ -56,12 +56,31 @@ typedef HRESULT (WINAPI *PFN_CREATE_DXGI_FACTORY)(REFIID riid, void **ppFactory)
 #include "hwcontext_drm.h"
 #include "hwcontext_internal.h"
 #include "hwcontext_vaapi.h"
+#include "hwcontext_vaapi_internal.h"
 #include "mem.h"
 #include "pixdesc.h"
 #include "pixfmt.h"
 
+/* Helper to get the VAAPIDevicePriv from AVHWDeviceContext */
+#define VAAPI_PRIV_FROM_DEVCTX(ctx) ((VAAPIDevicePriv *)(ctx)->user_opaque)
+
+/* Helper to get the VAAPIDevicePriv from AVHWFramesContext */
+#define VAAPI_PRIV_FROM_FRMCTX(hwfc) ((VAAPIDevicePriv *)(hwfc)->device_ctx->user_opaque)
+
+/* Local VA_CALL macro that uses priv->va_loader. The internal header's VA_CALL
+ * takes a loader directly, but here we wrap it for convenience. */
+#if CONFIG_VAAPI_DLOPEN
+#include "vaapi_loader.h"
+#define VA_CALL_LOCAL(priv, func, ...) ((priv)->va_loader->func(__VA_ARGS__))
+#else
+#define VA_CALL_LOCAL(priv, func, ...) ((void)(priv), func(__VA_ARGS__))
+#endif
+
 
 typedef struct VAAPIDevicePriv {
+#if CONFIG_VAAPI_DLOPEN
+    VAAPILoader *va_loader;
+#endif
 #if HAVE_VAAPI_X11
     Display *x11_display;
 #endif
@@ -252,12 +271,13 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
 
     if (config &&
         !(hwctx->driver_quirks & AV_VAAPI_DRIVER_QUIRK_SURFACE_ATTRIBUTES)) {
+        VAAPIDevicePriv *priv = VAAPI_PRIV_FROM_DEVCTX(hwdev);
         attr_count = 0;
-        vas = vaQuerySurfaceAttributes(hwctx->display, config->config_id,
+        vas = VA_CALL_LOCAL(priv, vaQuerySurfaceAttributes, hwctx->display, config->config_id,
                                        0, &attr_count);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwdev, AV_LOG_ERROR, "Failed to query surface attributes: "
-                   "%d (%s).\n", vas, vaErrorStr(vas));
+                   "%d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
             err = AVERROR(ENOSYS);
             goto fail;
         }
@@ -268,11 +288,11 @@ static int vaapi_frames_get_constraints(AVHWDeviceContext *hwdev,
             goto fail;
         }
 
-        vas = vaQuerySurfaceAttributes(hwctx->display, config->config_id,
+        vas = VA_CALL_LOCAL(priv, vaQuerySurfaceAttributes, hwctx->display, config->config_id,
                                        attr_list, &attr_count);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwdev, AV_LOG_ERROR, "Failed to query surface attributes: "
-                   "%d (%s).\n", vas, vaErrorStr(vas));
+                   "%d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
             err = AVERROR(ENOSYS);
             goto fail;
         }
@@ -403,6 +423,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
 {
     VAAPIDeviceContext *ctx = hwdev->hwctx;
     AVVAAPIDeviceContext *hwctx = &ctx->p;
+    VAAPIDevicePriv *priv = VAAPI_PRIV_FROM_DEVCTX(hwdev);
     VAImageFormat *image_list = NULL;
     VAStatus vas;
     const char *vendor_string;
@@ -410,7 +431,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
     enum AVPixelFormat pix_fmt;
     unsigned int fourcc;
 
-    image_count = vaMaxNumImageFormats(hwctx->display);
+    image_count = VA_CALL_LOCAL(priv, vaMaxNumImageFormats, hwctx->display);
     if (image_count <= 0) {
         err = AVERROR(EIO);
         goto fail;
@@ -420,7 +441,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
         err = AVERROR(ENOMEM);
         goto fail;
     }
-    vas = vaQueryImageFormats(hwctx->display, image_list, &image_count);
+    vas = VA_CALL_LOCAL(priv, vaQueryImageFormats, hwctx->display, image_list, &image_count);
     if (vas != VA_STATUS_SUCCESS) {
         err = AVERROR(EIO);
         goto fail;
@@ -448,7 +469,7 @@ static int vaapi_device_init(AVHWDeviceContext *hwdev)
         }
     }
 
-    vendor_string = vaQueryVendorString(hwctx->display);
+    vendor_string = VA_CALL_LOCAL(priv, vaQueryVendorString, hwctx->display);
     if (vendor_string)
         av_log(hwdev, AV_LOG_VERBOSE, "VAAPI driver: %s.\n", vendor_string);
 
@@ -501,15 +522,17 @@ static void vaapi_buffer_free(void *opaque, uint8_t *data)
 {
     AVHWFramesContext     *hwfc = opaque;
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VASurfaceID surface_id;
     VAStatus vas;
 
     surface_id = (VASurfaceID)(uintptr_t)data;
 
-    vas = vaDestroySurfaces(hwctx->display, &surface_id, 1);
+    vas = VA_CALL_LOCAL(priv, vaDestroySurfaces, hwctx->display, &surface_id, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to destroy surface %#x: "
-               "%d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
     }
 }
 
@@ -519,6 +542,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
     VAAPIFramesContext     *ctx = hwfc->hwctx;
     AVVAAPIFramesContext  *avfc = &ctx->p;
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VASurfaceID surface_id;
     VAStatus vas;
     AVBufferRef *ref;
@@ -527,13 +551,13 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
         avfc->nb_surfaces >= hwfc->initial_pool_size)
         return NULL;
 
-    vas = vaCreateSurfaces(hwctx->display, ctx->rt_format,
-                           hwfc->width, hwfc->height,
-                           &surface_id, 1,
-                           ctx->attributes, ctx->nb_attributes);
+    vas = VA_CALL_LOCAL(priv, vaCreateSurfaces, hwctx->display, ctx->rt_format,
+                  hwfc->width, hwfc->height,
+                  &surface_id, 1,
+                  ctx->attributes, ctx->nb_attributes);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to create surface: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         return NULL;
     }
     av_log(hwfc, AV_LOG_DEBUG, "Created surface %#x.\n", surface_id);
@@ -542,7 +566,7 @@ static AVBufferRef *vaapi_pool_alloc(void *opaque, size_t size)
                            sizeof(surface_id), &vaapi_buffer_free,
                            hwfc, AV_BUFFER_FLAG_READONLY);
     if (!ref) {
-        vaDestroySurfaces(hwctx->display, &surface_id, 1);
+        VA_CALL_LOCAL(priv, vaDestroySurfaces, hwctx->display, &surface_id, 1);
         return NULL;
     }
 
@@ -562,6 +586,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
     VAAPIFramesContext     *ctx = hwfc->hwctx;
     AVVAAPIFramesContext  *avfc = &ctx->p;
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     const VAAPIFormatDescriptor *desc;
     VAImageFormat *expected_format;
     AVBufferRef *test_surface = NULL;
@@ -677,7 +702,7 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
     err = vaapi_get_image_format(hwfc->device_ctx,
                                  hwfc->sw_format, &expected_format);
     if (err == 0) {
-        vas = vaDeriveImage(hwctx->display, test_surface_id, &test_image);
+        vas = VA_CALL_LOCAL(priv, vaDeriveImage, hwctx->display, test_surface_id, &test_image);
         if (vas == VA_STATUS_SUCCESS) {
             if (expected_format->fourcc == test_image.format.fourcc) {
                 av_log(hwfc, AV_LOG_DEBUG, "Direct mapping possible.\n");
@@ -688,11 +713,11 @@ static int vaapi_frames_init(AVHWFramesContext *hwfc)
                        "expected format %08x.\n",
                        expected_format->fourcc, test_image.format.fourcc);
             }
-            vaDestroyImage(hwctx->display, test_image.image_id);
+            VA_CALL_LOCAL(priv, vaDestroyImage, hwctx->display, test_image.image_id);
         } else {
             av_log(hwfc, AV_LOG_DEBUG, "Direct mapping disabled: "
                    "deriving image does not work: "
-                   "%d (%s).\n", vas, vaErrorStr(vas));
+                   "%d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         }
     } else {
         av_log(hwfc, AV_LOG_DEBUG, "Direct mapping disabled: "
@@ -772,6 +797,7 @@ static void vaapi_unmap_frame(AVHWFramesContext *hwfc,
                               HWMapDescriptor *hwmap)
 {
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VAAPIMapping           *map = hwmap->priv;
     VASurfaceID surface_id;
     VAStatus vas;
@@ -779,27 +805,30 @@ static void vaapi_unmap_frame(AVHWFramesContext *hwfc,
     surface_id = (VASurfaceID)(uintptr_t)hwmap->source->data[3];
     av_log(hwfc, AV_LOG_DEBUG, "Unmap surface %#x.\n", surface_id);
 
-    vas = vaUnmapBuffer(hwctx->display, map->image.buf);
+    vas = VA_CALL_LOCAL(priv, vaUnmapBuffer, hwctx->display, map->image.buf);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to unmap image from surface "
-               "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%#x: %d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
     }
 
     if ((map->flags & AV_HWFRAME_MAP_WRITE) &&
         !(map->flags & AV_HWFRAME_MAP_DIRECT)) {
-        vas = vaPutImage(hwctx->display, surface_id, map->image.image_id,
-                         0, 0, hwfc->width, hwfc->height,
-                         0, 0, hwfc->width, hwfc->height);
+        vas = VA_CALL_LOCAL(priv, vaPutImage, hwctx->display, surface_id, map->image.image_id,
+                      0, 0, hwfc->width, hwfc->height,
+                      0, 0, hwfc->width, hwfc->height);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwfc, AV_LOG_ERROR, "Failed to write image to surface "
-                   "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+                   "%#x: %d (%s).\n", surface_id, vas,
+                   VA_CALL_LOCAL(priv, vaErrorStr, vas));
         }
     }
 
-    vas = vaDestroyImage(hwctx->display, map->image.image_id);
+    vas = VA_CALL_LOCAL(priv, vaDestroyImage, hwctx->display, map->image.image_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to destroy image from surface "
-               "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%#x: %d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
     }
 
     av_free(map);
@@ -809,6 +838,7 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
                            AVFrame *dst, const AVFrame *src, int flags)
 {
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VAAPIFramesContext *ctx = hwfc->hwctx;
     VASurfaceID surface_id;
     const VAAPIFormatDescriptor *desc;
@@ -847,10 +877,11 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
     map->flags = flags;
     map->image.image_id = VA_INVALID_ID;
 
-    vas = vaSyncSurface(hwctx->display, surface_id);
+    vas = VA_CALL_LOCAL(priv, vaSyncSurface, hwctx->display, surface_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to sync surface "
-               "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%#x: %d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail;
     }
@@ -864,11 +895,11 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
     // prefer not to be given direct-mapped memory if they request read access.
     if (ctx->derive_works && dst->format == hwfc->sw_format &&
         ((flags & AV_HWFRAME_MAP_DIRECT) || !(flags & AV_HWFRAME_MAP_READ))) {
-        vas = vaDeriveImage(hwctx->display, surface_id, &map->image);
+        vas = VA_CALL_LOCAL(priv, vaDeriveImage, hwctx->display, surface_id, &map->image);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwfc, AV_LOG_ERROR, "Failed to derive image from "
                    "surface %#x: %d (%s).\n",
-                   surface_id, vas, vaErrorStr(vas));
+                   surface_id, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
             err = AVERROR(EIO);
             goto fail;
         }
@@ -881,22 +912,22 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
         }
         map->flags |= AV_HWFRAME_MAP_DIRECT;
     } else {
-        vas = vaCreateImage(hwctx->display, image_format,
-                            hwfc->width, hwfc->height, &map->image);
+        vas = VA_CALL_LOCAL(priv, vaCreateImage, hwctx->display, image_format,
+                      hwfc->width, hwfc->height, &map->image);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwfc, AV_LOG_ERROR, "Failed to create image for "
                    "surface %#x: %d (%s).\n",
-                   surface_id, vas, vaErrorStr(vas));
+                   surface_id, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
             err = AVERROR(EIO);
             goto fail;
         }
         if (!(flags & AV_HWFRAME_MAP_OVERWRITE)) {
-            vas = vaGetImage(hwctx->display, surface_id, 0, 0,
-                             hwfc->width, hwfc->height, map->image.image_id);
+            vas = VA_CALL_LOCAL(priv, vaGetImage, hwctx->display, surface_id, 0, 0,
+                          hwfc->width, hwfc->height, map->image.image_id);
             if (vas != VA_STATUS_SUCCESS) {
                 av_log(hwfc, AV_LOG_ERROR, "Failed to read image from "
                        "surface %#x: %d (%s).\n",
-                       surface_id, vas, vaErrorStr(vas));
+                       surface_id, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
                 err = AVERROR(EIO);
                 goto fail;
             }
@@ -909,13 +940,14 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
     if (flags & AV_HWFRAME_MAP_WRITE)
         vaflags |= VA_MAPBUFFER_FLAG_WRITE;
     // On drivers not implementing vaMapBuffer2 libva calls vaMapBuffer instead.
-    vas = vaMapBuffer2(hwctx->display, map->image.buf, &address, vaflags);
+    vas = VA_CALL_LOCAL(priv, vaMapBuffer2, hwctx->display, map->image.buf, &address, vaflags);
 #else
-    vas = vaMapBuffer(hwctx->display, map->image.buf, &address);
+    vas = VA_CALL_LOCAL(priv, vaMapBuffer, hwctx->display, map->image.buf, &address);
 #endif
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to map image from surface "
-               "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%#x: %d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail;
     }
@@ -944,9 +976,9 @@ static int vaapi_map_frame(AVHWFramesContext *hwfc,
 fail:
     if (map) {
         if (address)
-            vaUnmapBuffer(hwctx->display, map->image.buf);
+            VA_CALL_LOCAL(priv, vaUnmapBuffer, hwctx->display, map->image.buf);
         if (map->image.image_id != VA_INVALID_ID)
-            vaDestroyImage(hwctx->display, map->image.image_id);
+            VA_CALL_LOCAL(priv, vaDestroyImage, hwctx->display, map->image.image_id);
         av_free(map);
     }
     return err;
@@ -1082,12 +1114,13 @@ static void vaapi_unmap_from_drm(AVHWFramesContext *dst_fc,
                                  HWMapDescriptor *hwmap)
 {
     AVVAAPIDeviceContext *dst_dev = dst_fc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(dst_fc);
 
     VASurfaceID surface_id = (VASurfaceID)(uintptr_t)hwmap->priv;
 
     av_log(dst_fc, AV_LOG_DEBUG, "Destroy surface %#x.\n", surface_id);
 
-    vaDestroySurfaces(dst_dev->display, &surface_id, 1);
+    VA_CALL_LOCAL(priv, vaDestroySurfaces, dst_dev->display, &surface_id, 1);
 }
 
 static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
@@ -1102,6 +1135,7 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
     AVHWFramesContext      *dst_fc =
         (AVHWFramesContext*)dst->hw_frames_ctx->data;
     AVVAAPIDeviceContext  *dst_dev = dst_fc->device_ctx->hwctx;
+    VAAPIDevicePriv       *priv = VAAPI_PRIV_FROM_FRMCTX(dst_fc);
     const AVDRMFrameDescriptor *desc;
     const VAAPIFormatDescriptor *format_desc;
     VASurfaceID surface_id;
@@ -1218,9 +1252,9 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
          * Gallium seem to do the correct error checks, so lets just try the
          * PRIME_2 import first.
          */
-        vas = vaCreateSurfaces(dst_dev->display, format_desc->rt_format,
-                               src->width, src->height, &surface_id, 1,
-                               prime_attrs, FF_ARRAY_ELEMS(prime_attrs));
+        vas = VA_CALL_LOCAL(priv, vaCreateSurfaces, dst_dev->display, format_desc->rt_format,
+                      src->width, src->height, &surface_id, 1,
+                      prime_attrs, FF_ARRAY_ELEMS(prime_attrs));
         if (vas != VA_STATUS_SUCCESS)
             src_vafc->prime_2_import_unsupported = 1;
     }
@@ -1269,10 +1303,10 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
             FFSWAP(uint32_t, buffer_desc.offsets[1], buffer_desc.offsets[2]);
         }
 
-        vas = vaCreateSurfaces(dst_dev->display, format_desc->rt_format,
-                               src->width, src->height,
-                               &surface_id, 1,
-                               buffer_attrs, FF_ARRAY_ELEMS(buffer_attrs));
+        vas = VA_CALL_LOCAL(priv, vaCreateSurfaces, dst_dev->display, format_desc->rt_format,
+                      src->width, src->height,
+                      &surface_id, 1,
+                      buffer_attrs, FF_ARRAY_ELEMS(buffer_attrs));
     }
 #else
     buffer_handle = desc->objects[0].fd;
@@ -1300,14 +1334,14 @@ static int vaapi_map_from_drm(AVHWFramesContext *src_fc, AVFrame *dst,
         FFSWAP(uint32_t, buffer_desc.offsets[1], buffer_desc.offsets[2]);
     }
 
-    vas = vaCreateSurfaces(dst_dev->display, format_desc->rt_format,
-                           src->width, src->height,
-                           &surface_id, 1,
-                           attrs, FF_ARRAY_ELEMS(attrs));
+    vas = VA_CALL_LOCAL(priv, vaCreateSurfaces, dst_dev->display, format_desc->rt_format,
+                  src->width, src->height,
+                  &surface_id, 1,
+                  attrs, FF_ARRAY_ELEMS(attrs));
 #endif
     if (vas != VA_STATUS_SUCCESS) {
         av_log(dst_fc, AV_LOG_ERROR, "Failed to create surface from DRM "
-               "object: %d (%s).\n", vas, vaErrorStr(vas));
+               "object: %d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         return AVERROR(EIO);
     }
     av_log(dst_fc, AV_LOG_DEBUG, "Create surface %#x.\n", surface_id);
@@ -1345,6 +1379,7 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
                                 const AVFrame *src, int flags)
 {
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VASurfaceID surface_id;
     VAStatus vas;
     VADRMPRIMESurfaceDescriptor va_desc;
@@ -1358,10 +1393,11 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
     if (flags & AV_HWFRAME_MAP_READ) {
         export_flags |= VA_EXPORT_SURFACE_READ_ONLY;
 
-        vas = vaSyncSurface(hwctx->display, surface_id);
+        vas = VA_CALL_LOCAL(priv, vaSyncSurface, hwctx->display, surface_id);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(hwfc, AV_LOG_ERROR, "Failed to sync surface "
-                   "%#x: %d (%s).\n", surface_id, vas, vaErrorStr(vas));
+                   "%#x: %d (%s).\n", surface_id, vas,
+                   VA_CALL_LOCAL(priv, vaErrorStr, vas));
             return AVERROR(EIO);
         }
     }
@@ -1369,14 +1405,15 @@ static int vaapi_map_to_drm_esh(AVHWFramesContext *hwfc, AVFrame *dst,
     if (flags & AV_HWFRAME_MAP_WRITE)
         export_flags |= VA_EXPORT_SURFACE_WRITE_ONLY;
 
-    vas = vaExportSurfaceHandle(hwctx->display, surface_id,
-                                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                export_flags, &va_desc);
+    vas = VA_CALL_LOCAL(priv, vaExportSurfaceHandle, hwctx->display, surface_id,
+                  VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                  export_flags, &va_desc);
     if (vas != VA_STATUS_SUCCESS) {
         if (vas == VA_STATUS_ERROR_UNIMPLEMENTED)
             return AVERROR(ENOSYS);
         av_log(hwfc, AV_LOG_ERROR, "Failed to export surface %#x: "
-               "%d (%s).\n", surface_id, vas, vaErrorStr(vas));
+               "%d (%s).\n", surface_id, vas,
+               VA_CALL_LOCAL(priv, vaErrorStr, vas));
         return AVERROR(EIO);
     }
 
@@ -1439,6 +1476,7 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
                                   HWMapDescriptor *hwmap)
 {
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VAAPIDRMImageBufferMapping *mapping = hwmap->priv;
     VASurfaceID surface_id;
     VAStatus vas;
@@ -1450,19 +1488,19 @@ static void vaapi_unmap_to_drm_abh(AVHWFramesContext *hwfc,
     // DRM PRIME file descriptors are closed by vaReleaseBufferHandle(),
     // so we shouldn't close them separately.
 
-    vas = vaReleaseBufferHandle(hwctx->display, mapping->image.buf);
+    vas = VA_CALL_LOCAL(priv, vaReleaseBufferHandle, hwctx->display, mapping->image.buf);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to release buffer "
                "handle of image %#x (derived from surface %#x): "
                "%d (%s).\n", mapping->image.buf, surface_id,
-               vas, vaErrorStr(vas));
+               vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
     }
 
-    vas = vaDestroyImage(hwctx->display, mapping->image.image_id);
+    vas = VA_CALL_LOCAL(priv, vaDestroyImage, hwctx->display, mapping->image.image_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to destroy image "
                "derived from surface %#x: %d (%s).\n",
-               surface_id, vas, vaErrorStr(vas));
+               surface_id, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
     }
 
     av_free(mapping);
@@ -1472,6 +1510,7 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
                                 const AVFrame *src, int flags)
 {
     AVVAAPIDeviceContext *hwctx = hwfc->device_ctx->hwctx;
+    VAAPIDevicePriv      *priv = VAAPI_PRIV_FROM_FRMCTX(hwfc);
     VAAPIDRMImageBufferMapping *mapping = NULL;
     VASurfaceID surface_id;
     VAStatus vas;
@@ -1485,12 +1524,12 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
     if (!mapping)
         return AVERROR(ENOMEM);
 
-    vas = vaDeriveImage(hwctx->display, surface_id,
-                        &mapping->image);
+    vas = VA_CALL_LOCAL(priv, vaDeriveImage, hwctx->display, surface_id,
+                  &mapping->image);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to derive image from "
                "surface %#x: %d (%s).\n",
-               surface_id, vas, vaErrorStr(vas));
+               surface_id, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail;
     }
@@ -1545,13 +1584,13 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
         }
     }
 
-    vas = vaAcquireBufferHandle(hwctx->display, mapping->image.buf,
-                                &mapping->buffer_info);
+    vas = VA_CALL_LOCAL(priv, vaAcquireBufferHandle, hwctx->display, mapping->image.buf,
+                  &mapping->buffer_info);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Failed to get buffer "
                "handle from image %#x (derived from surface %#x): "
                "%d (%s).\n", mapping->image.buf, surface_id,
-               vas, vaErrorStr(vas));
+               vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail_derived;
     }
@@ -1580,9 +1619,9 @@ static int vaapi_map_to_drm_abh(AVHWFramesContext *hwfc, AVFrame *dst,
     return 0;
 
 fail_mapped:
-    vaReleaseBufferHandle(hwctx->display, mapping->image.buf);
+    VA_CALL_LOCAL(priv, vaReleaseBufferHandle, hwctx->display, mapping->image.buf);
 fail_derived:
-    vaDestroyImage(hwctx->display, mapping->image.image_id);
+    VA_CALL_LOCAL(priv, vaDestroyImage, hwctx->display, mapping->image.image_id);
 fail:
     av_freep(&mapping);
     return err;
@@ -1638,7 +1677,7 @@ static void vaapi_device_free(AVHWDeviceContext *ctx)
     VAAPIDevicePriv      *priv  = ctx->user_opaque;
 
     if (hwctx->display)
-        vaTerminate(hwctx->display);
+        VA_CALL_LOCAL(priv, vaTerminate, hwctx->display);
 
 #if HAVE_VAAPI_X11
     if (priv->x11_display)
@@ -1647,6 +1686,10 @@ static void vaapi_device_free(AVHWDeviceContext *ctx)
 
     if (priv->drm_fd >= 0)
         close(priv->drm_fd);
+
+#if CONFIG_VAAPI_DLOPEN
+    ff_vaapi_loader_uninit(&priv->va_loader);
+#endif
 
     av_freep(&priv);
 }
@@ -1671,20 +1714,21 @@ static int vaapi_device_connect(AVHWDeviceContext *ctx,
                                 VADisplay display)
 {
     AVVAAPIDeviceContext *hwctx = ctx->hwctx;
+    VAAPIDevicePriv *priv = VAAPI_PRIV_FROM_DEVCTX(ctx);
     int major, minor;
     VAStatus vas;
 
 #if CONFIG_VAAPI_1
-    vaSetErrorCallback(display, &vaapi_device_log_error, ctx);
-    vaSetInfoCallback (display, &vaapi_device_log_info,  ctx);
+    VA_CALL_LOCAL(priv, vaSetErrorCallback, display, &vaapi_device_log_error, ctx);
+    VA_CALL_LOCAL(priv, vaSetInfoCallback, display, &vaapi_device_log_info,  ctx);
 #endif
 
     hwctx->display = display;
 
-    vas = vaInitialize(display, &major, &minor);
+    vas = VA_CALL_LOCAL(priv, vaInitialize, display, &major, &minor);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(ctx, AV_LOG_ERROR, "Failed to initialise VAAPI "
-               "connection: %d (%s).\n", vas, vaErrorStr(vas));
+               "connection: %d (%s).\n", vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
         return AVERROR(EIO);
     }
     av_log(ctx, AV_LOG_VERBOSE, "Initialised VAAPI connection: "
@@ -1700,6 +1744,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
     VADisplay display = NULL;
     const AVDictionaryEntry *ent;
     int try_drm, try_x11, try_win32, try_all;
+    int ret;
 
     priv = av_mallocz(sizeof(*priv));
     if (!priv)
@@ -1709,6 +1754,16 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
 
     ctx->user_opaque = priv;
     ctx->free        = vaapi_device_free;
+
+#if CONFIG_VAAPI_DLOPEN
+    ret = ff_vaapi_loader_init(&priv->va_loader);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_VERBOSE, "VAAPI not available (dlopen failed)\n");
+        av_freep(&priv);
+        ctx->user_opaque = NULL;
+        return ret;
+    }
+#endif
 
     ent = av_dict_get(opts, "connection_type", NULL, 0);
     if (ent) {
@@ -1845,7 +1900,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
                 break;
         }
 
-        display = vaGetDisplayDRM(priv->drm_fd);
+        display = VA_CALL_LOCAL(priv, vaGetDisplayDRM, priv->drm_fd);
         if (!display) {
             av_log(ctx, AV_LOG_VERBOSE, "Cannot open a VA display "
                    "from DRM device %s.\n", device);
@@ -1863,7 +1918,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
             av_log(ctx, AV_LOG_VERBOSE, "Cannot open X11 display "
                    "%s.\n", XDisplayName(device));
         } else {
-            display = vaGetDisplay(priv->x11_display);
+            display = VA_CALL_LOCAL(priv, vaGetDisplay, priv->x11_display);
             if (!display) {
                 av_log(ctx, AV_LOG_ERROR, "Cannot open a VA display "
                        "from X11 display %s.\n", XDisplayName(device));
@@ -1880,7 +1935,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
     if (!display && try_win32) {
         // Try to create a display from the specified device, if any.
         if (!device) {
-            display = vaGetDisplayWin32(NULL);
+            display = VA_CALL_LOCAL(priv, vaGetDisplayWin32, NULL);
         } else {
             IDXGIFactory2 *pDXGIFactory = NULL;
             IDXGIAdapter *pAdapter = NULL;
@@ -1916,7 +1971,7 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
                               desc.VendorId, desc.DeviceId, desc.Description,
                               desc.AdapterLuid.LowPart,
                               desc.AdapterLuid.HighPart);
-                        display = vaGetDisplayWin32(&desc.AdapterLuid);
+                        display = VA_CALL_LOCAL(priv, vaGetDisplayWin32, &desc.AdapterLuid);
                     }
                     IDXGIAdapter_Release(pAdapter);
                 }
@@ -1952,11 +2007,11 @@ static int vaapi_device_create(AVHWDeviceContext *ctx, const char *device,
     if (ent) {
 #if VA_CHECK_VERSION(0, 38, 0)
         VAStatus vas;
-        vas = vaSetDriverName(display, ent->value);
+        vas = VA_CALL_LOCAL(priv, vaSetDriverName, display, ent->value);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(ctx, AV_LOG_ERROR, "Failed to set driver name to "
-                   "%s: %d (%s).\n", ent->value, vas, vaErrorStr(vas));
-            vaTerminate(display);
+                   "%s: %d (%s).\n", ent->value, vas, VA_CALL_LOCAL(priv, vaErrorStr, vas));
+            VA_CALL_LOCAL(priv, vaTerminate, display);
             return AVERROR_EXTERNAL;
         }
 #else
@@ -2043,7 +2098,17 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
         ctx->user_opaque = priv;
         ctx->free        = &vaapi_device_free;
 
-        display = vaGetDisplayDRM(fd);
+#if CONFIG_VAAPI_DLOPEN
+        {
+            int ret = ff_vaapi_loader_init(&priv->va_loader);
+            if (ret < 0) {
+                av_log(ctx, AV_LOG_VERBOSE, "VAAPI not available (dlopen failed)\n");
+                return ret;
+            }
+        }
+#endif
+
+        display = VA_CALL_LOCAL(priv, vaGetDisplayDRM, fd);
         if (!display) {
             av_log(ctx, AV_LOG_ERROR, "Failed to open a VA display from "
                    "DRM device.\n");
@@ -2055,6 +2120,19 @@ static int vaapi_device_derive(AVHWDeviceContext *ctx,
 #endif
     return AVERROR(ENOSYS);
 }
+
+#if CONFIG_VAAPI_DLOPEN
+VAAPILoader *ff_vaapi_get_loader(AVHWDeviceContext *hwdev)
+{
+    VAAPIDevicePriv *priv;
+
+    if (!hwdev || hwdev->type != AV_HWDEVICE_TYPE_VAAPI)
+        return NULL;
+
+    priv = hwdev->user_opaque;
+    return priv ? priv->va_loader : NULL;
+}
+#endif
 
 const HWContextType ff_hwcontext_type_vaapi = {
     .type                   = AV_HWDEVICE_TYPE_VAAPI,

@@ -29,6 +29,7 @@
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_vaapi.h"
+#include "libavutil/hwcontext_vaapi_internal.h"
 
 #include "avcodec.h"
 #include "hwconfig.h"
@@ -200,6 +201,11 @@ typedef struct VAAPIEncodeContext {
     VAContextID     va_context;
 
     AVVAAPIDeviceContext *hwctx;
+
+#if CONFIG_VAAPI_DLOPEN
+    // VAAPI loader for dlopen mode
+    VAAPILoader *va_loader;
+#endif
 
     // Pool of (reusable) bitstream output buffers.
     struct AVRefStructPool *output_buffer_pool;

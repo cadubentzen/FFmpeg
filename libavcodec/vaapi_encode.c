@@ -38,6 +38,13 @@ const AVCodecHWConfigInternal *const ff_vaapi_encode_hw_configs[] = {
     NULL,
 };
 
+/* Local macro for VA calls - uses ctx->va_loader when dlopen is enabled */
+#if CONFIG_VAAPI_DLOPEN
+#define VAAPI_CALL(ctx, func, ...) VA_CALL((ctx)->va_loader, func, __VA_ARGS__)
+#else
+#define VAAPI_CALL(ctx, func, ...) func(__VA_ARGS__)
+#endif
+
 static int vaapi_encode_make_packed_header(AVCodecContext *avctx,
                                            VAAPIEncodePicture *pic,
                                            int type, char *data, size_t bit_len)
@@ -57,24 +64,24 @@ static int vaapi_encode_make_packed_header(AVCodecContext *avctx,
         return AVERROR(ENOMEM);
     pic->param_buffers = tmp;
 
-    vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
-                         VAEncPackedHeaderParameterBufferType,
-                         sizeof(params), 1, &params, &param_buffer);
+    vas = VAAPI_CALL(ctx, vaCreateBuffer, ctx->hwctx->display, ctx->va_context,
+                     VAEncPackedHeaderParameterBufferType,
+                     sizeof(params), 1, &params, &param_buffer);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create parameter buffer "
                "for packed header (type %d): %d (%s).\n",
-               type, vas, vaErrorStr(vas));
+               type, vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR(EIO);
     }
     pic->param_buffers[pic->nb_param_buffers++] = param_buffer;
 
-    vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
-                         VAEncPackedHeaderDataBufferType,
-                         (bit_len + 7) / 8, 1, data, &data_buffer);
+    vas = VAAPI_CALL(ctx, vaCreateBuffer, ctx->hwctx->display, ctx->va_context,
+                     VAEncPackedHeaderDataBufferType,
+                     (bit_len + 7) / 8, 1, data, &data_buffer);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create data buffer "
                "for packed header (type %d): %d (%s).\n",
-               type, vas, vaErrorStr(vas));
+               type, vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR(EIO);
     }
     pic->param_buffers[pic->nb_param_buffers++] = data_buffer;
@@ -98,11 +105,11 @@ static int vaapi_encode_make_param_buffer(AVCodecContext *avctx,
         return AVERROR(ENOMEM);
     pic->param_buffers = tmp;
 
-    vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
-                         type, len, 1, data, &buffer);
+    vas = VAAPI_CALL(ctx, vaCreateBuffer, ctx->hwctx->display, ctx->va_context,
+                     type, len, 1, data, &buffer);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create parameter buffer "
-               "(type %d): %d (%s).\n", type, vas, vaErrorStr(vas));
+               "(type %d): %d (%s).\n", type, vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR(EIO);
     }
     pic->param_buffers[pic->nb_param_buffers++] = buffer;
@@ -157,21 +164,21 @@ static int vaapi_encode_wait(AVCodecContext *avctx, FFHWBaseEncodePicture *base_
 
 #if VA_CHECK_VERSION(1, 9, 0)
     if (base_ctx->async_encode) {
-        vas = vaSyncBuffer(ctx->hwctx->display,
+        vas = VAAPI_CALL(ctx, vaSyncBuffer, ctx->hwctx->display,
                            pic->output_buffer,
                            VA_TIMEOUT_INFINITE);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(avctx, AV_LOG_ERROR, "Failed to sync to output buffer completion: "
-                   "%d (%s).\n", vas, vaErrorStr(vas));
+                   "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
             return AVERROR(EIO);
         }
     } else
 #endif
     { // If vaSyncBuffer is not implemented, try old version API.
-        vas = vaSyncSurface(ctx->hwctx->display, pic->input_surface);
+        vas = VAAPI_CALL(ctx, vaSyncSurface, ctx->hwctx->display, pic->input_surface);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(avctx, AV_LOG_ERROR, "Failed to sync to picture completion: "
-                "%d (%s).\n", vas, vaErrorStr(vas));
+                "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
             return AVERROR(EIO);
         }
     }
@@ -587,28 +594,28 @@ static int vaapi_encode_issue(AVCodecContext *avctx,
     }
 #endif
 
-    vas = vaBeginPicture(ctx->hwctx->display, ctx->va_context,
+    vas = VAAPI_CALL(ctx, vaBeginPicture, ctx->hwctx->display, ctx->va_context,
                          pic->input_surface);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to begin picture encode issue: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail_with_picture;
     }
 
-    vas = vaRenderPicture(ctx->hwctx->display, ctx->va_context,
+    vas = VAAPI_CALL(ctx, vaRenderPicture, ctx->hwctx->display, ctx->va_context,
                           pic->param_buffers, pic->nb_param_buffers);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to upload encode parameters: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail_with_picture;
     }
 
-    vas = vaEndPicture(ctx->hwctx->display, ctx->va_context);
+    vas = VAAPI_CALL(ctx, vaEndPicture, ctx->hwctx->display, ctx->va_context);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to end picture encode issue: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         // vaRenderPicture() has been called here, so we should not destroy
         // the parameter buffers unless separate destruction is required.
@@ -622,12 +629,12 @@ static int vaapi_encode_issue(AVCodecContext *avctx,
     if (CONFIG_VAAPI_1 || ctx->hwctx->driver_quirks &
         AV_VAAPI_DRIVER_QUIRK_RENDER_PARAM_BUFFERS) {
         for (i = 0; i < pic->nb_param_buffers; i++) {
-            vas = vaDestroyBuffer(ctx->hwctx->display,
+            vas = VAAPI_CALL(ctx, vaDestroyBuffer, ctx->hwctx->display,
                                   pic->param_buffers[i]);
             if (vas != VA_STATUS_SUCCESS) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to destroy "
                        "param buffer %#x: %d (%s).\n",
-                       pic->param_buffers[i], vas, vaErrorStr(vas));
+                       pic->param_buffers[i], vas, VAAPI_CALL(ctx, vaErrorStr, vas));
                 // And ignore.
             }
         }
@@ -636,10 +643,10 @@ static int vaapi_encode_issue(AVCodecContext *avctx,
     return 0;
 
 fail_with_picture:
-    vaEndPicture(ctx->hwctx->display, ctx->va_context);
+    VAAPI_CALL(ctx, vaEndPicture, ctx->hwctx->display, ctx->va_context);
 fail:
     for(i = 0; i < pic->nb_param_buffers; i++)
-        vaDestroyBuffer(ctx->hwctx->display, pic->param_buffers[i]);
+        VAAPI_CALL(ctx, vaDestroyBuffer, ctx->hwctx->display, pic->param_buffers[i]);
     if (pic->slices) {
         for (i = 0; i < pic->nb_slices; i++)
             av_freep(&pic->slices[i].codec_slice_params);
@@ -662,11 +669,11 @@ static int vaapi_encode_get_coded_buffer_size(AVCodecContext *avctx, VABufferID 
     VAStatus vas;
     int err;
 
-    vas = vaMapBuffer(ctx->hwctx->display, buf_id,
+    vas = VAAPI_CALL(ctx, vaMapBuffer, ctx->hwctx->display, buf_id,
                       (void**)&buf_list);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to map output buffers: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         return err;
     }
@@ -674,10 +681,10 @@ static int vaapi_encode_get_coded_buffer_size(AVCodecContext *avctx, VABufferID 
     for (buf = buf_list; buf; buf = buf->next)
         size += buf->size;
 
-    vas = vaUnmapBuffer(ctx->hwctx->display, buf_id);
+    vas = VAAPI_CALL(ctx, vaUnmapBuffer, ctx->hwctx->display, buf_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to unmap output buffers: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         return err;
     }
@@ -693,11 +700,11 @@ static int vaapi_encode_get_coded_buffer_data(AVCodecContext *avctx,
     VAStatus vas;
     int err;
 
-    vas = vaMapBuffer(ctx->hwctx->display, buf_id,
+    vas = VAAPI_CALL(ctx, vaMapBuffer, ctx->hwctx->display, buf_id,
                       (void**)&buf_list);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to map output buffers: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         return err;
     }
@@ -710,10 +717,10 @@ static int vaapi_encode_get_coded_buffer_data(AVCodecContext *avctx,
         *dst += buf->size;
     }
 
-    vas = vaUnmapBuffer(ctx->hwctx->display, buf_id);
+    vas = VAAPI_CALL(ctx, vaUnmapBuffer, ctx->hwctx->display, buf_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to unmap output buffers: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         return err;
     }
@@ -977,16 +984,16 @@ static av_cold int vaapi_encode_profile_entrypoint(AVCodecContext *avctx)
     av_log(avctx, AV_LOG_VERBOSE, "Input surface format is %s.\n",
            desc->name);
 
-    n = vaMaxNumProfiles(ctx->hwctx->display);
+    n = VAAPI_CALL(ctx, vaMaxNumProfiles, ctx->hwctx->display);
     va_profiles = av_malloc_array(n, sizeof(VAProfile));
     if (!va_profiles) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
-    vas = vaQueryConfigProfiles(ctx->hwctx->display, va_profiles, &n);
+    vas = VAAPI_CALL(ctx, vaQueryConfigProfiles, ctx->hwctx->display, va_profiles, &n);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query profiles: %d (%s).\n",
-               vas, vaErrorStr(vas));
+               vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1007,7 +1014,7 @@ static av_cold int vaapi_encode_profile_entrypoint(AVCodecContext *avctx)
             continue;
 
 #if VA_CHECK_VERSION(1, 0, 0)
-        profile_string = vaProfileStr(profile->va_profile);
+        profile_string = VAAPI_CALL(ctx, vaProfileStr, profile->va_profile);
 #else
         profile_string = "(no profile names)";
 #endif
@@ -1037,18 +1044,18 @@ static av_cold int vaapi_encode_profile_entrypoint(AVCodecContext *avctx)
     av_log(avctx, AV_LOG_VERBOSE, "Using VAAPI profile %s (%d).\n",
            profile_string, ctx->va_profile);
 
-    n = vaMaxNumEntrypoints(ctx->hwctx->display);
+    n = VAAPI_CALL(ctx, vaMaxNumEntrypoints, ctx->hwctx->display);
     va_entrypoints = av_malloc_array(n, sizeof(VAEntrypoint));
     if (!va_entrypoints) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
-    vas = vaQueryConfigEntrypoints(ctx->hwctx->display, ctx->va_profile,
+    vas = VAAPI_CALL(ctx, vaQueryConfigEntrypoints, ctx->hwctx->display, ctx->va_profile,
                                    va_entrypoints, &n);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query entrypoints for "
                "profile %s (%d): %d (%s).\n", profile_string,
-               ctx->va_profile, vas, vaErrorStr(vas));
+               ctx->va_profile, vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1070,7 +1077,7 @@ static av_cold int vaapi_encode_profile_entrypoint(AVCodecContext *avctx)
 
     ctx->va_entrypoint = va_entrypoints[i];
 #if VA_CHECK_VERSION(1, 0, 0)
-    entrypoint_string = vaEntrypointStr(ctx->va_entrypoint);
+    entrypoint_string = VAAPI_CALL(ctx, vaEntrypointStr, ctx->va_entrypoint);
 #else
     entrypoint_string = "(no entrypoint names)";
 #endif
@@ -1095,12 +1102,12 @@ static av_cold int vaapi_encode_profile_entrypoint(AVCodecContext *avctx)
     }
 
     rt_format_attr = (VAConfigAttrib) { VAConfigAttribRTFormat };
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile, ctx->va_entrypoint,
                                 &rt_format_attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query RT format "
-               "config attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "config attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1143,20 +1150,20 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
     VAStatus vas;
     int err = 0;
 
-    vas = vaCreateConfig(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaCreateConfig, ctx->hwctx->display,
                          ctx->va_profile, ctx->va_entrypoint,
                          NULL, 0, &va_config);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create temp encode pipeline "
-               "configuration: %d (%s).\n", vas, vaErrorStr(vas));
+               "configuration: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR(EIO);
     }
 
-    vas = vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
+    vas = VAAPI_CALL(ctx, vaQuerySurfaceAttributes, ctx->hwctx->display, va_config,
                                    0, &attr_count);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query surface attributes: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1167,11 +1174,11 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
         goto fail;
     }
 
-    vas = vaQuerySurfaceAttributes(ctx->hwctx->display, va_config,
+    vas = VAAPI_CALL(ctx, vaQuerySurfaceAttributes, ctx->hwctx->display, va_config,
                                    attr_list, &attr_count);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query surface attributes: "
-               "%d (%s).\n", vas, vaErrorStr(vas));
+               "%d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR_EXTERNAL;
         goto fail;
     }
@@ -1188,7 +1195,7 @@ static av_cold int vaapi_encode_surface_alignment(av_unused AVCodecContext *avct
 
 fail:
     av_freep(&attr_list);
-    vaDestroyConfig(ctx->hwctx->display, va_config);
+    VAAPI_CALL(ctx, vaDestroyConfig, ctx->hwctx->display, va_config);
     return err;
 #else
     return 0;
@@ -1232,12 +1239,12 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
     VAStatus vas;
     char supported_rc_modes_string[64];
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile, ctx->va_entrypoint,
                                 &rc_attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query rate control "
-               "config attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "config attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
     if (rc_attr.value == VA_ATTRIB_NOT_SUPPORTED) {
@@ -1588,14 +1595,14 @@ static av_cold int vaapi_encode_init_max_frame_size(AVCodecContext *avctx)
         return AVERROR(EINVAL);
     }
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 &attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         ctx->max_frame_size = 0;
         av_log(avctx, AV_LOG_ERROR, "Failed to query max frame size "
-               "config attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "config attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
 
@@ -1640,13 +1647,13 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
     uint32_t ref_l0, ref_l1;
     int prediction_pre_only, err;
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 &attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query reference frames "
-               "attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
 
@@ -1664,13 +1671,13 @@ static av_cold int vaapi_encode_init_gop_structure(AVCodecContext *avctx)
     if (!(ctx->codec->flags & FF_HW_FLAG_INTRA_ONLY ||
         avctx->gop_size <= 1)) {
         attr = (VAConfigAttrib) { VAConfigAttribPredictionDirection };
-        vas = vaGetConfigAttributes(ctx->hwctx->display,
+        vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                     ctx->va_profile,
                                     ctx->va_entrypoint,
                                     &attr, 1);
         if (vas != VA_STATUS_SUCCESS) {
             av_log(avctx, AV_LOG_WARNING, "Failed to query prediction direction "
-                   "attribute: %d (%s).\n", vas, vaErrorStr(vas));
+                   "attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
             return AVERROR_EXTERNAL;
         } else if (attr.value == VA_ATTRIB_NOT_SUPPORTED) {
             av_log(avctx, AV_LOG_VERBOSE, "Driver does not report any additional "
@@ -1851,13 +1858,13 @@ static av_cold int vaapi_encode_init_slice_structure(AVCodecContext *avctx)
         return 0;
     }
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 attr, FF_ARRAY_ELEMS(attr));
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query slice "
-               "attributes: %d (%s).\n", vas, vaErrorStr(vas));
+               "attributes: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
     max_slices      = attr[0].value;
@@ -1914,13 +1921,13 @@ static av_cold int vaapi_encode_init_packed_headers(AVCodecContext *avctx)
     VAStatus vas;
     VAConfigAttrib attr = { VAConfigAttribEncPackedHeaders };
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 &attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query packed headers "
-               "attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
 
@@ -1976,13 +1983,13 @@ static av_cold int vaapi_encode_init_quality(AVCodecContext *avctx)
     VAConfigAttrib attr = { VAConfigAttribEncQualityRange };
     int quality = avctx->compression_level;
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 &attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query quality "
-               "config attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "config attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
 
@@ -2023,13 +2030,13 @@ static av_cold int vaapi_encode_init_roi(AVCodecContext *avctx)
     VAStatus vas;
     VAConfigAttrib attr = { VAConfigAttribEncROI };
 
-    vas = vaGetConfigAttributes(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaGetConfigAttributes, ctx->hwctx->display,
                                 ctx->va_profile,
                                 ctx->va_entrypoint,
                                 &attr, 1);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to query ROI "
-               "config attribute: %d (%s).\n", vas, vaErrorStr(vas));
+               "config attribute: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR_EXTERNAL;
     }
 
@@ -2057,7 +2064,7 @@ static void vaapi_encode_free_output_buffer(AVRefStructOpaque opaque,
     VABufferID *buffer_id_ref = obj;
     VABufferID buffer_id = *buffer_id_ref;
 
-    vaDestroyBuffer(ctx->hwctx->display, buffer_id);
+    VAAPI_CALL(ctx, vaDestroyBuffer, ctx->hwctx->display, buffer_id);
 
     av_log(avctx, AV_LOG_DEBUG, "Freed output buffer %#x\n", buffer_id);
 }
@@ -2074,13 +2081,13 @@ static int vaapi_encode_alloc_output_buffer(AVRefStructOpaque opaque, void *obj)
     // to hold the largest possible compressed frame.  We assume here
     // that the uncompressed frame plus some header data is an upper
     // bound on that.
-    vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
+    vas = VAAPI_CALL(ctx, vaCreateBuffer, ctx->hwctx->display, ctx->va_context,
                          VAEncCodedBufferType,
                          3 * base_ctx->surface_width * base_ctx->surface_height +
                          (1 << 16), 1, 0, buffer_id);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create bitstream "
-               "output buffer: %d (%s).\n", vas, vaErrorStr(vas));
+               "output buffer: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         return AVERROR(ENOMEM);
     }
 
@@ -2169,6 +2176,15 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
 
     ctx->hwctx = base_ctx->device->hwctx;
 
+#if CONFIG_VAAPI_DLOPEN
+    ctx->va_loader = ff_vaapi_get_loader(base_ctx->device);
+    if (!ctx->va_loader) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get VAAPI loader.\n");
+        err = AVERROR(EINVAL);
+        goto fail;
+    }
+#endif
+
     err = vaapi_encode_profile_entrypoint(avctx);
     if (err < 0)
         goto fail;
@@ -2223,13 +2239,13 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
             goto fail;
     }
 
-    vas = vaCreateConfig(ctx->hwctx->display,
+    vas = VAAPI_CALL(ctx, vaCreateConfig, ctx->hwctx->display,
                          ctx->va_profile, ctx->va_entrypoint,
                          ctx->config_attributes, ctx->nb_config_attributes,
                          &ctx->va_config);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create encode pipeline "
-               "configuration: %d (%s).\n", vas, vaErrorStr(vas));
+               "configuration: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail;
     }
@@ -2239,7 +2255,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
         goto fail;
 
     recon_hwctx = base_ctx->recon_frames->hwctx;
-    vas = vaCreateContext(ctx->hwctx->display, ctx->va_config,
+    vas = VAAPI_CALL(ctx, vaCreateContext, ctx->hwctx->display, ctx->va_config,
                           base_ctx->surface_width, base_ctx->surface_height,
                           VA_PROGRESSIVE,
                           recon_hwctx->surface_ids,
@@ -2247,7 +2263,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
                           &ctx->va_context);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create encode pipeline "
-               "context: %d (%s).\n", vas, vaErrorStr(vas));
+               "context: %d (%s).\n", vas, VAAPI_CALL(ctx, vaErrorStr, vas));
         err = AVERROR(EIO);
         goto fail;
     }
@@ -2321,7 +2337,7 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
 
 #if VA_CHECK_VERSION(1, 9, 0)
     // check vaSyncBuffer function
-    vas = vaSyncBuffer(ctx->hwctx->display, VA_INVALID_ID, 0);
+    vas = VAAPI_CALL(ctx, vaSyncBuffer, ctx->hwctx->display, VA_INVALID_ID, 0);
     if (vas != VA_STATUS_ERROR_UNIMPLEMENTED) {
         base_ctx->async_encode = 1;
         base_ctx->encode_fifo = av_fifo_alloc2(base_ctx->async_depth,
@@ -2358,13 +2374,13 @@ av_cold int ff_vaapi_encode_close(AVCodecContext *avctx)
 
     if (ctx->va_context != VA_INVALID_ID) {
         if (ctx->hwctx)
-            vaDestroyContext(ctx->hwctx->display, ctx->va_context);
+            VAAPI_CALL(ctx, vaDestroyContext, ctx->hwctx->display, ctx->va_context);
         ctx->va_context = VA_INVALID_ID;
     }
 
     if (ctx->va_config != VA_INVALID_ID) {
         if (ctx->hwctx)
-            vaDestroyConfig(ctx->hwctx->display, ctx->va_config);
+            VAAPI_CALL(ctx, vaDestroyConfig, ctx->hwctx->display, ctx->va_config);
         ctx->va_config = VA_INVALID_ID;
     }
 
