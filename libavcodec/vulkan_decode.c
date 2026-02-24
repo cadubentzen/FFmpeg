@@ -543,6 +543,16 @@ int ff_vk_decode_frame(AVCodecContext *avctx,
         return err;
     cmd_buf = exec->buf;
 
+    /* At DPB reset boundaries (IDR/keyframe), the DPB slot indices may be
+     * reused by the new sequence. Insert a GPU-side wait for all prior
+     * submissions to prevent concurrent DPB slot conflicts across queues. */
+    if (vp->dpb_reset) {
+        err = ff_vk_exec_pool_drain_wait(&ctx->s, &ctx->exec_pool, exec,
+                                          VK_PIPELINE_STAGE_2_VIDEO_DECODE_BIT_KHR);
+        if (err < 0)
+            return err;
+    }
+
     /* Slices */
     err = ff_vk_exec_add_dep_buf(&ctx->s, exec, &vp->slices_buf, 1, 0);
     if (err < 0)

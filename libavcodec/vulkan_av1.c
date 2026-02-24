@@ -636,6 +636,8 @@ static int vk_av1_end_frame(AVCodecContext *avctx)
         rav[i] = ap->ref_src[i]->f;
     }
 
+    vp->dpb_reset = pic->raw_frame_header->frame_type == AV1_FRAME_KEY;
+
     av_log(avctx, AV_LOG_DEBUG, "Decoding frame, %zu bytes, %i tiles\n",
            vp->slices_size, ap->av1_pic_info.tileCount);
 

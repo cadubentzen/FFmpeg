@@ -556,6 +556,8 @@ static int vk_h264_end_frame(AVCodecContext *avctx)
         rav[i] = hp->ref_src[i]->f;
     }
 
+    vp->dpb_reset = h->picture_idr;
+
     av_log(avctx, AV_LOG_DEBUG, "Decoding frame, %zu bytes, %i slices\n",
            vp->slices_size, hp->h264_pic_info.sliceCount);
 

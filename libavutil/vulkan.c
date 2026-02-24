@@ -345,6 +345,8 @@ void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool)
     }
     if (pool->query_pool)
         vk->DestroyQueryPool(s->hwctx->act_dev, pool->query_pool, s->hwctx->alloc);
+    if (pool->drain_sem)
+        vk->DestroySemaphore(s->hwctx->act_dev, pool->drain_sem, s->hwctx->alloc);
 
     av_free(pool->query_data);
     av_free(pool->cmd_buf_pools);
@@ -508,6 +510,28 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
         vk->GetDeviceQueue(s->hwctx->act_dev, qf->idx, e->qi, &e->queue);
     }
 
+    /* Pool-wide drain semaphore */
+    {
+        VkSemaphoreTypeCreateInfo sem_type = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initialValue = 0,
+        };
+        VkSemaphoreCreateInfo sem_create = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &sem_type,
+        };
+        ret = vk->CreateSemaphore(s->hwctx->act_dev, &sem_create,
+                                  s->hwctx->alloc, &pool->drain_sem);
+        if (ret != VK_SUCCESS) {
+            av_log(s, AV_LOG_ERROR, "Failed to create drain semaphore: %s\n",
+                   ff_vk_ret2str(ret));
+            err = AVERROR_EXTERNAL;
+            goto fail;
+        }
+        pool->drain_sem_value = 0;
+    }
+
     return 0;
 
 fail:
@@ -553,6 +577,17 @@ void ff_vk_exec_wait(FFVulkanContext *s, FFVkExecContext *e)
     FFVulkanFunctions *vk = &s->vkfn;
     vk->WaitForFences(s->hwctx->act_dev, 1, &e->fence, VK_TRUE, UINT64_MAX);
     ff_vk_exec_discard_deps(s, e);
+}
+
+int ff_vk_exec_pool_drain_wait(FFVulkanContext *s, FFVkExecPool *pool,
+                                FFVkExecContext *e,
+                                VkPipelineStageFlagBits2 stage)
+{
+    if (!pool->drain_sem_value)
+        return 0;
+
+    return ff_vk_exec_add_dep_wait_sem(s, e, pool->drain_sem,
+                                       pool->drain_sem_value, stage);
 }
 
 int ff_vk_exec_start(FFVulkanContext *s, FFVkExecContext *e)
@@ -904,11 +939,26 @@ int ff_vk_exec_submit(FFVulkanContext *s, FFVkExecContext *e)
 {
     VkResult ret;
     FFVulkanFunctions *vk = &s->vkfn;
+    FFVkExecPool *pool = (FFVkExecPool *)e->parent;
     VkCommandBufferSubmitInfo cmd_buf_info = (VkCommandBufferSubmitInfo) {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .commandBuffer = e->buf,
     };
-    VkSubmitInfo2 submit_info = (VkSubmitInfo2) {
+    VkSubmitInfo2 submit_info;
+
+    /* Signal the pool-wide drain semaphore on every submission */
+    if (pool->drain_sem) {
+        VkSemaphoreSubmitInfo *sem_sig;
+        ARR_REALLOC(e, sem_sig, &e->sem_sig_alloc, e->sem_sig_cnt);
+        e->sem_sig[e->sem_sig_cnt++] = (VkSemaphoreSubmitInfo) {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = pool->drain_sem,
+            .value = pool->drain_sem_value + 1,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+    }
+
+    submit_info = (VkSubmitInfo2) {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pCommandBufferInfos = &cmd_buf_info,
         .commandBufferInfoCount = 1,
@@ -936,6 +986,9 @@ int ff_vk_exec_submit(FFVulkanContext *s, FFVkExecContext *e)
         ff_vk_exec_discard_deps(s, e);
         return AVERROR_EXTERNAL;
     }
+
+    if (pool->drain_sem)
+        pool->drain_sem_value++;
 
     for (int i = 0; i < e->sem_sig_val_dst_cnt; i++)
         *e->sem_sig_val_dst[i] += 1;

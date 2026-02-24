@@ -99,6 +99,12 @@ typedef struct FFVulkanDecodePicture {
     AVBufferRef                    *slices_buf;
     size_t                          slices_size;
 
+    /* Set by codecs at IDR/keyframe boundaries to indicate the DPB is being
+     * reset. The common decode layer will insert a GPU-side drain wait to
+     * ensure all prior decode submissions complete before the DPB slot
+     * indices are reused, avoiding concurrent DPB slot conflicts. */
+    int                             dpb_reset;
+
     /* Vulkan functions needed for destruction, as no other context is guaranteed to exist */
     PFN_vkWaitSemaphores            wait_semaphores;
     PFN_vkDestroyImageView          destroy_image_view;

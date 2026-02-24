@@ -304,6 +304,13 @@ typedef struct FFVkExecPool {
     int nb_queries;
     size_t qd_size;
 
+    /* Pool-wide timeline semaphore for draining all in-flight submissions.
+     * Every exec submit signals this semaphore. Consumers that need to wait
+     * for all prior work (e.g. DPB reset at IDR boundaries) add a GPU-side
+     * wait on drain_sem at drain_sem_value, avoiding CPU-side stalls. */
+    VkSemaphore drain_sem;
+    uint64_t drain_sem_value;
+
     /* Registered shaders' data */
     FFVulkanShaderData reg_shd[FF_VK_MAX_SHADERS];
     int nb_reg_shd;
@@ -503,6 +510,15 @@ VkResult ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
 int ff_vk_exec_start(FFVulkanContext *s, FFVkExecContext *e);
 int ff_vk_exec_submit(FFVulkanContext *s, FFVkExecContext *e);
 void ff_vk_exec_wait(FFVulkanContext *s, FFVkExecContext *e);
+
+/**
+ * Add a GPU-side wait on the pool's drain semaphore to the given exec context,
+ * ensuring all prior submissions to this pool complete before it executes.
+ * Must be called between ff_vk_exec_start() and ff_vk_exec_submit().
+ */
+int ff_vk_exec_pool_drain_wait(FFVulkanContext *s, FFVkExecPool *pool,
+                                FFVkExecContext *e,
+                                VkPipelineStageFlagBits2 stage);
 
 /**
  * Execution dependency management.

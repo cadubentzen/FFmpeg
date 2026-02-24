@@ -921,6 +921,8 @@ static int vk_hevc_end_frame(AVCodecContext *avctx)
         rvp[i] = &rfhp->vp;
     }
 
+    vp->dpb_reset = IS_IDR(h);
+
     av_log(avctx, AV_LOG_DEBUG, "Decoding frame, %zu bytes, %i slices\n",
            vp->slices_size, hp->h265_pic_info.sliceSegmentCount);
 

@@ -338,6 +338,8 @@ static int vk_vp9_end_frame(AVCodecContext *avctx)
         rav[i] = ap->ref_src[i]->tf.f;
     }
 
+    vp->dpb_reset = s->h.keyframe;
+
     av_log(avctx, AV_LOG_VERBOSE, "Decoding frame, %zu bytes\n",
            vp->slices_size);
 
