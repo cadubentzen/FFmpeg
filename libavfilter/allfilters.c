@@ -349,6 +349,7 @@ extern const FFFilter ff_vf_lensfun;
 extern const FFFilter ff_vf_libplacebo;
 extern const FFFilter ff_vf_libvmaf;
 extern const FFFilter ff_vf_libvmaf_cuda;
+extern const FFFilter ff_vf_libvmaf_vulkan;
 extern const FFFilter ff_vf_limitdiff;
 extern const FFFilter ff_vf_limiter;
 extern const FFFilter ff_vf_loop;

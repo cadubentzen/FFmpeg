@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2017 Ronald S. Bultje <rsbultje@gmail.com>
  * Copyright (c) 2017 Ashish Pratap Singh <ashk43712@gmail.com>
+ * Copyright (c) 2026 Carlos Bentzen <cadubentzen@igalia.com>
  *
  * This file is part of FFmpeg.
  *
@@ -46,6 +47,13 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #endif
 
+#if CONFIG_LIBVMAF_VULKAN_FILTER
+#include <libvmaf_vulkan.h>
+
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_vulkan.h"
+#endif
+
 typedef struct LIBVMAFContext {
     const AVClass *class;
     FFFrameSync fs;
@@ -63,6 +71,10 @@ typedef struct LIBVMAFContext {
     unsigned bpc;
 #if CONFIG_LIBVMAF_CUDA_FILTER
     VmafCudaState *cu_state;
+#endif
+#if CONFIG_LIBVMAF_VULKAN_FILTER
+    VmafVulkanState *vk_state;
+    VkFormat vk_format;
 #endif
 } LIBVMAFContext;
 
@@ -89,6 +101,10 @@ static enum VmafPixelFormat pix_fmt_map(enum AVPixelFormat av_pix_fmt)
     case AV_PIX_FMT_YUV420P10LE:
     case AV_PIX_FMT_YUV420P12LE:
     case AV_PIX_FMT_YUV420P16LE:
+    case AV_PIX_FMT_NV12:
+    case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_P012LE:
+    case AV_PIX_FMT_P016LE:
         return VMAF_PIX_FMT_YUV420P;
     case AV_PIX_FMT_YUV422P:
     case AV_PIX_FMT_YUV422P10LE:
@@ -823,6 +839,238 @@ const FFFilter ff_vf_libvmaf_cuda = {
     FILTER_INPUTS(libvmaf_inputs),
     FILTER_OUTPUTS(libvmaf_outputs_cuda),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+};
+#endif
+
+#if CONFIG_LIBVMAF_VULKAN_FILTER
+static const enum AVPixelFormat vulkan_supported_formats[] = {
+    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_P010LE,
+    AV_PIX_FMT_YUV420P10LE,
+    AV_PIX_FMT_YUV422P10LE,
+    AV_PIX_FMT_YUV444P10LE,
+    AV_PIX_FMT_P012LE,
+    AV_PIX_FMT_YUV420P12LE,
+    AV_PIX_FMT_YUV422P12LE,
+    AV_PIX_FMT_YUV444P12LE,
+    AV_PIX_FMT_P016LE,
+    AV_PIX_FMT_YUV420P16LE,
+    AV_PIX_FMT_YUV422P16LE,
+    AV_PIX_FMT_YUV444P16LE,
+};
+
+static int vulkan_format_is_supported(enum AVPixelFormat fmt)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(vulkan_supported_formats); i++)
+        if (vulkan_supported_formats[i] == fmt)
+            return 1;
+    return 0;
+}
+
+static int config_props_vulkan(AVFilterLink *outlink)
+{
+    int err;
+    AVFilterContext *ctx = outlink->src;
+    LIBVMAFContext *s = ctx->priv;
+    AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink *inl = ff_filter_link(inlink);
+    AVHWFramesContext *frames_ctx;
+    AVVulkanDeviceContext *device_hwctx;
+    AVVulkanFramesContext *frames_hwctx;
+    const AVPixFmtDescriptor *desc;
+    int comp_qf_idx = -1;
+
+    if (!inl->hw_frames_ctx) {
+        av_log(ctx, AV_LOG_ERROR, "A hardware frames context is "
+               "required for the input.\n");
+        return AVERROR(EINVAL);
+    }
+
+    frames_ctx = (AVHWFramesContext *)inl->hw_frames_ctx->data;
+    device_hwctx = frames_ctx->device_ctx->hwctx;
+    frames_hwctx = frames_ctx->hwctx;
+    desc = av_pix_fmt_desc_get(frames_ctx->sw_format);
+
+    if (!vulkan_format_is_supported(frames_ctx->sw_format)) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Unsupported input format: %s\n", desc->name);
+        return AVERROR(EINVAL);
+    }
+
+    s->bpc = desc->comp[0].depth;
+    s->vk_format = frames_hwctx->format[0];
+
+    for (int i = 0; i < device_hwctx->nb_qf; i++) {
+        if (device_hwctx->qf[i].flags & VK_QUEUE_COMPUTE_BIT) {
+            comp_qf_idx = i;
+            break;
+        }
+    }
+    if (comp_qf_idx < 0) {
+        av_log(ctx, AV_LOG_ERROR, "No compute queue family found.\n");
+        return AVERROR(EINVAL);
+    }
+
+    VmafConfiguration cfg = {
+        .log_level = log_level_map(av_log_get_level()),
+        .n_subsample = s->n_subsample,
+        .n_threads = s->n_threads,
+    };
+
+    VmafVulkanConfiguration vk_cfg = {
+        .instance = device_hwctx->inst,
+        .phys_device = device_hwctx->phys_dev,
+        .get_proc_addr = device_hwctx->get_proc_addr,
+        .device = device_hwctx->act_dev,
+        .compute_queue_family = device_hwctx->qf[comp_qf_idx].idx,
+    };
+
+    err = vmaf_init(&s->vmaf, cfg);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR, "problem during vmaf_init.\n");
+        return AVERROR(EINVAL);
+    }
+
+    err = vmaf_vulkan_state_init(&s->vk_state, vk_cfg);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR, "problem during vmaf_vulkan_state_init.\n");
+        return AVERROR(EINVAL);
+    }
+
+    err = vmaf_vulkan_import_state(s->vmaf, s->vk_state);
+    free(s->vk_state);
+    s->vk_state = NULL;
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem during vmaf_vulkan_import_state.\n");
+        return AVERROR(EINVAL);
+    }
+
+    VmafVulkanPictureConfiguration pic_cfg = {
+        .pic_params = {
+            .w = inlink->w,
+            .h = inlink->h,
+            .bpc = s->bpc,
+            .pix_fmt = pix_fmt_map(frames_ctx->sw_format),
+        },
+        .pic_prealloc_method =
+            VMAF_VULKAN_PICTURE_PREALLOCATION_METHOD_BIND,
+    };
+
+    err = vmaf_vulkan_preallocate_pictures(s->vmaf, pic_cfg);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem during vmaf_vulkan_preallocate_pictures.\n");
+        return AVERROR(EINVAL);
+    }
+
+    err = parse_models(ctx);
+    if (err)
+        return err;
+
+    err = parse_features(ctx);
+    if (err)
+        return err;
+
+    return config_output(outlink);
+}
+
+static int bind_picture_data_vulkan(LIBVMAFContext *s,
+                                    AVFilterContext *ctx,
+                                    AVFrame *src, VmafPicture *dst)
+{
+    AVVkFrame *vkf = (AVVkFrame *)src->data[0];
+    int err;
+
+    VmafVulkanImageInfo image_info = {
+        .image = vkf->img[0],
+        .layout = &vkf->layout[0],
+        .format = s->vk_format,
+        .width = src->width,
+        .height = src->height,
+        .semaphore = vkf->sem[0],
+        .semaphore_value = &vkf->sem_value[0],
+    };
+
+    err = vmaf_vulkan_picture_bind_image(s->vmaf, dst, &image_info);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem during vmaf_vulkan_picture_bind_image.\n");
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
+static int do_vmaf_vulkan(FFFrameSync *fs)
+{
+    AVFilterContext *ctx = fs->parent;
+    LIBVMAFContext *s = ctx->priv;
+    VmafPicture pic_ref, pic_dist;
+    AVFrame *ref, *dist;
+    int err = 0;
+
+    err = ff_framesync_dualinput_get(fs, &dist, &ref);
+    if (err < 0)
+        return err;
+    if (ctx->is_disabled || !ref)
+        return ff_filter_frame(ctx->outputs[0], dist);
+
+    err = bind_picture_data_vulkan(s, ctx, ref, &pic_ref);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem during bind_picture_data_vulkan.\n");
+        return AVERROR(ENOMEM);
+    }
+
+    err = bind_picture_data_vulkan(s, ctx, dist, &pic_dist);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR,
+               "problem during bind_picture_data_vulkan.\n");
+        return AVERROR(ENOMEM);
+    }
+
+    err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt++);
+    if (err) {
+        av_log(ctx, AV_LOG_ERROR, "problem during vmaf_read_pictures.\n");
+        return AVERROR(EINVAL);
+    }
+
+    return ff_filter_frame(ctx->outputs[0], dist);
+}
+
+static av_cold int init_vulkan(AVFilterContext *ctx)
+{
+    LIBVMAFContext *s = ctx->priv;
+    s->fs.on_event = do_vmaf_vulkan;
+    return 0;
+}
+
+static const AVFilterPad libvmaf_outputs_vulkan[] = {
+    {
+        .name          = "default",
+        .type          = AVMEDIA_TYPE_VIDEO,
+        .config_props  = config_props_vulkan,
+    },
+};
+
+const FFFilter ff_vf_libvmaf_vulkan = {
+    .p.name         = "libvmaf_vulkan",
+    .p.description  = NULL_IF_CONFIG_SMALL("Calculate the VMAF between two "
+                                           "video streams using Vulkan compute."),
+    .p.priv_class   = &libvmaf_class,
+    .preinit        = libvmaf_framesync_preinit,
+    .init           = init_vulkan,
+    .uninit         = uninit,
+    .activate       = activate,
+    .priv_size      = sizeof(LIBVMAFContext),
+    FILTER_INPUTS(libvmaf_inputs),
+    FILTER_OUTPUTS(libvmaf_outputs_vulkan),
+    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 #endif
