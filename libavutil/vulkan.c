@@ -475,6 +475,8 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
 
     pool->pool_size = nb_contexts;
 
+    int pool_qi = ff_vk_pool_pick_queue(s->device, qf->idx, qf->num);
+
     /* Init contexts */
     for (int i = 0; i < pool->pool_size; i++) {
         FFVkExecContext *e = &pool->contexts[i];
@@ -502,8 +504,10 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
         /* Command buffer */
         e->buf = pool->cmd_bufs[i];
 
-        /* Queue index distribution */
-        e->qi = i % qf->num;
+        /* Queue index distribution: pin all contexts in a pool to the same
+         * queue to avoid interleaved submissions from different pools on the
+         * same queue, which can trigger GPU scheduling deadlocks in NVDEC. */
+        e->qi = pool_qi;
         e->qf = qf->idx;
         vk->GetDeviceQueue(s->hwctx->act_dev, qf->idx, e->qi, &e->queue);
     }

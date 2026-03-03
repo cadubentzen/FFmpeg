@@ -167,6 +167,9 @@ typedef struct VulkanDevicePriv {
 
     /* Maximum queues */
     int limit_queues;
+
+    /* Per-queue-family pool assignment counters */
+    atomic_int pool_qf_qi[64];
 } VulkanDevicePriv;
 
 typedef struct VulkanFramesPriv {
@@ -1902,6 +1905,12 @@ static void unlock_queue(AVHWDeviceContext *ctx, uint32_t queue_family, uint32_t
 {
     VulkanDevicePriv *p = ctx->hwctx;
     pthread_mutex_unlock(&p->qf_mutex[queue_family][index]);
+}
+
+int ff_vk_pool_pick_queue(AVHWDeviceContext *ctx, int qf_idx, int nb_queues)
+{
+    VulkanDevicePriv *p = ctx->hwctx;
+    return atomic_fetch_add(&p->pool_qf_qi[qf_idx], 1) % nb_queues;
 }
 
 static int vulkan_device_init(AVHWDeviceContext *ctx)

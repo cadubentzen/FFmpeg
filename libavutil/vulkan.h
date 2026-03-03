@@ -470,6 +470,12 @@ AVVulkanDeviceQueueFamily *ff_vk_qf_find(FFVulkanContext *s,
                                          VkVideoCodecOperationFlagBitsKHR vid_ops);
 
 /**
+ * Pick a queue index for a new exec pool from the device-level counter.
+ * Distributes pools round-robin across the queues in the given family.
+ */
+int ff_vk_pool_pick_queue(AVHWDeviceContext *ctx, int qf_idx, int nb_queues);
+
+/**
  * Allocates/frees an execution pool.
  * If used in a multi-threaded context, there must be at least as many contexts
  * as there are threads.
