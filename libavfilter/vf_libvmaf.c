@@ -988,12 +988,14 @@ static int bind_picture_data_vulkan(LIBVMAFContext *s,
 
     VmafVulkanImageInfo image_info = {
         .image = vkf->img[0],
-        .layout = &vkf->layout[0],
+        .layout = vkf->layout[0],
         .format = s->vk_format,
         .width = src->width,
         .height = src->height,
-        .semaphore = vkf->sem[0],
-        .semaphore_value = &vkf->sem_value[0],
+        .acquire_semaphore = vkf->sem[0],
+        .acquire_semaphore_value = vkf->sem_value[0],
+        .release_semaphore = vkf->sem[0],
+        .release_semaphore_value = vkf->sem_value[0] + 1,
     };
 
     err = vmaf_vulkan_picture_bind_image(s->vmaf, dst, &image_info);
@@ -1020,25 +1022,48 @@ static int do_vmaf_vulkan(FFFrameSync *fs)
     if (ctx->is_disabled || !ref)
         return ff_filter_frame(ctx->outputs[0], dist);
 
+    AVHWFramesContext *hwfc = (AVHWFramesContext *)ref->hw_frames_ctx->data;
+    AVVulkanFramesContext *vkfc = hwfc->hwctx;
+    AVVkFrame *ref_vkf = (AVVkFrame *)ref->data[0];
+    AVVkFrame *dist_vkf = (AVVkFrame *)dist->data[0];
+
+    /* Lock both frames to protect sem_value reads. The decoder thread
+     * may concurrently call ff_vk_exec_add_dep_frame() for DPB references,
+     * which also locks and reads sem_value[0]. Hold locks across bind +
+     * read_pictures, then increment sem_value and unlock — matching the
+     * pattern in ff_vk_exec_submit(). */
+    vkfc->lock_frame(hwfc, ref_vkf);
+    vkfc->lock_frame(hwfc, dist_vkf);
+
     err = bind_picture_data_vulkan(s, ctx, ref, &pic_ref);
     if (err) {
         av_log(ctx, AV_LOG_ERROR,
                "problem during bind_picture_data_vulkan.\n");
-        return AVERROR(ENOMEM);
+        goto unlock;
     }
 
     err = bind_picture_data_vulkan(s, ctx, dist, &pic_dist);
     if (err) {
         av_log(ctx, AV_LOG_ERROR,
                "problem during bind_picture_data_vulkan.\n");
-        return AVERROR(ENOMEM);
+        goto unlock;
     }
 
     err = vmaf_read_pictures(s->vmaf, &pic_ref, &pic_dist, s->frame_cnt++);
     if (err) {
         av_log(ctx, AV_LOG_ERROR, "problem during vmaf_read_pictures.\n");
-        return AVERROR(EINVAL);
+        goto unlock;
     }
+
+    ref_vkf->sem_value[0]++;
+    dist_vkf->sem_value[0]++;
+
+unlock:
+    vkfc->unlock_frame(hwfc, ref_vkf);
+    vkfc->unlock_frame(hwfc, dist_vkf);
+
+    if (err)
+        return AVERROR(EINVAL);
 
     return ff_filter_frame(ctx->outputs[0], dist);
 }
